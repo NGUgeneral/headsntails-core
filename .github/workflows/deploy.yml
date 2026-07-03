@@ -1,36 +1,44 @@
 name: Continuous Integration (headsntails-core)
 
 on:
-  push:
+  pull_request:
     branches:
       - main
-  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
     branches:
       - main
 
 jobs:
+  # --- STAGE 1: VERIFICATION GATE (Runs on BOTH PRs and Merge to Main) ---
   validate:
     name: Build Verification & Lint
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Pull down the source code from your repository
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 2. Set up native Go environment to run unit tests
     - name: Set up Go
       uses: actions/setup-go@v5
       with:
-        go-version: '1.26.3'
+        go-version: '1.26.3' # Matches your explicit platform specification
 
-    # 3. Execute native test suite locally on the runner
-    - name: Run Unit Tests
+    - name: Run Unit Tests with Race Detection
       run: |
         go test -v -race ./...
 
-    # 4. Verify the Dockerfile builds cleanly as a final sanity check
+  # --- STAGE 2: PACKAGING GATE (Runs ONLY after a successful merge to Main) ---
+  package:
+    name: Build & Publish Production Container
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
     - name: Test Local Docker Build
-      if: false # disable image build
       run: |
-        docker build -t headsntails-core:test .
+        docker build -t headsntails-core:latest .
