@@ -15,6 +15,7 @@ import (
 
 	_ "headsntails-core/docs" // Dynamically generated package by 'swag init'
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
 )
@@ -25,54 +26,103 @@ type Engine struct {
 	mu           sync.RWMutex
 	flags        map[string]bool
 	rdb          *redis.Client
+	dbPool       *pgxpool.Pool
 	redisHashKey string
 }
 
 func NewEngine(cfg *config.Config) *Engine {
-	var opt *redis.Options
-	var err error
+	dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer dbCancel()
 
+	connString := cfg.GetPostgresConnectionString()
+	dbPool, err := pgxpool.New(dbCtx, connString)
+	if err != nil {
+		log.Fatalf("CRITICAL: Failed to create PostgreSQL connection pool allocation footprint: %v", err)
+	}
+
+	if err := dbPool.Ping(dbCtx); err != nil {
+		log.Fatalf("CRITICAL: PostgreSQL source of truth is unreachable: %v", err)
+	}
+	log.Println("PostgreSQL client pool initialized and verified successfully.")
+
+	var opt *redis.Options
 	if cfg.RedisURL != "" {
 		opt, err = redis.ParseURL(cfg.RedisURL)
 		if err != nil {
 			log.Fatalf("CRITICAL: Failed to parse secure Redis connection URL: %v", err)
 		}
-		log.Println("🔒 Redis client initialized securely via connection URL string (TLS Enabled).")
+		log.Println("Redis client initialized securely via connection URL string (TLS Enabled).")
 	} else {
 		opt = &redis.Options{
 			Addr:     cfg.RedisAddr,
 			Password: cfg.RedisPassword,
 			DB:       0,
 		}
-		log.Printf("🔓 Redis client initialized via unencrypted parameters. Target: %s", cfg.RedisAddr)
+		log.Printf("Redis client initialized via unencrypted parameters. Target: %s", cfg.RedisAddr)
 	}
 
 	rdb := redis.NewClient(opt)
 
+	redisCtx, redisCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer redisCancel()
+	if err := rdb.Ping(redisCtx).Err(); err != nil {
+		log.Fatalf("CRITICAL: Redis caching boundary is unreachable: %v", err)
+	}
+
 	engine := &Engine{
 		flags:        make(map[string]bool),
 		rdb:          rdb,
+		dbPool:       dbPool,
 		redisHashKey: cfg.RedisHashKey,
 	}
 
-	engine.hydrateFromRedis()
+	engine.hydrateAndSyncDatabases()
+
 	return engine
 }
 
-func (e *Engine) hydrateFromRedis() {
+func (e *Engine) hydrateAndSyncDatabases() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	storedFlags, err := e.rdb.HGetAll(ctx, e.redisHashKey).Result()
+	log.Println("Initializing critical source of truth state synchronization flow...")
+
+	rows, err := e.dbPool.Query(ctx, "SELECT service, key, value FROM public.feature_flags")
 	if err != nil {
-		log.Printf("Warning: Failed to hydrate from Redis, starting fresh: %v", err)
-		return
+		log.Fatalf("CRITICAL: Base system hydration failed during PostgreSQL stream extraction: %v", err)
+	}
+	defer rows.Close()
+
+	pipe := e.rdb.Pipeline()
+	pipe.Del(ctx, e.redisHashKey)
+
+	dbCount := 0
+	for rows.Next() {
+		var service, key string
+		var value bool
+		if err := rows.Scan(&service, &key, &value); err != nil {
+			log.Fatalf("CRITICAL: Row scans corrupted during schema extraction mapping loop: %v", err)
+		}
+
+		compositeKey := fmt.Sprintf("%s:%s", service, key)
+
+		e.flags[compositeKey] = value
+
+		valStr := "false"
+		if value {
+			valStr = "true"
+		}
+		pipe.HSet(ctx, e.redisHashKey, compositeKey, valStr)
+		dbCount++
 	}
 
-	for k, v := range storedFlags {
-		e.flags[k] = (v == "true")
+	if dbCount > 0 {
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Fatalf("CRITICAL: Failed to propagate primary database state down to Redis layer cache: %v", err)
+		}
 	}
-	log.Printf("Successfully hydrated %d flags into memory cache using namespace [%s].", len(e.flags), e.redisHashKey)
+
+	log.Printf("PARITY COMPLETE: Hydrated %d flags from PostgreSQL directly into Redis and Local Memory Cache.", dbCount)
 }
 
 func (e *Engine) CheckRedisConnectivity() error {
@@ -92,13 +142,34 @@ func (e *Engine) GetFlag(service, key string) bool {
 func (e *Engine) SetFlag(service, key string, value bool) error {
 	compositeKey := fmt.Sprintf("%s:%s", service, key)
 
+	tx, err := e.dbPool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to initialize db transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	query := `
+		INSERT INTO public.feature_flags (service, key, value, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (service, key)
+		DO UPDATE SET value = EXCLUDED.value, updated_at = NOW();
+	`
+	_, err = tx.Exec(ctx, query, service, key, value)
+	if err != nil {
+		return fmt.Errorf("postgresql source of truth write failure: %w", err)
+	}
+
 	valStr := "false"
 	if value {
 		valStr = "true"
 	}
 
 	if err := e.rdb.HSet(ctx, e.redisHashKey, compositeKey, valStr).Err(); err != nil {
-		return fmt.Errorf("redis write failure: %w", err)
+		return fmt.Errorf("redis cache write failure (postgres transaction aborted): %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit postgres transaction: %w", err)
 	}
 
 	e.mu.Lock()
@@ -205,12 +276,21 @@ func main() {
 func handleHealth(engine *Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+
+		if err := engine.dbPool.Ping(ctx); err != nil {
+			log.Printf("Health check failure: PostgreSQL unreachable: %v", err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "database": "disconnected"})
+			return
+		}
+
 		if err := engine.CheckRedisConnectivity(); err != nil {
 			log.Printf("Health check failure: Redis unreachable: %v", err)
 			w.WriteHeader(http.StatusServiceUnavailable)
-			json.NewEncoder(w).Encode(HealthResponse{Status: "unhealthy", Redis: "disconnected"})
+			json.NewEncoder(w).Encode(map[string]string{"status": "unhealthy", "redis": "disconnected"})
 			return
 		}
+
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(HealthResponse{Status: "healthy", Redis: "connected"})
 	}
