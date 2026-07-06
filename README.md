@@ -8,7 +8,7 @@ To eliminate database latency bottlenecks on high-volume evaluation requests, th
 * **The Performance Layer:** A standalone Redis cache services execution queries in sub-milliseconds.
 * **Lifecycle Flow:** On application cold start, a pipeline routine hydrates Redis entirely from PostgreSQL. Any subsequent administrative write operation performs an explicit Write-Through pattern: committing to SQL first, and updating/evicting the Redis cache block strictly upon SQL transaction success.
 
-## API Routing Contract (v0.1)
+## API Routing Contract (v0.2)
 
 All application routes are natively bound to the `/api/v1/` prefix.
 
@@ -22,11 +22,19 @@ All application routes are natively bound to the `/api/v1/` prefix.
 ## Environment Configuration
 
 The engine relies entirely on runtime environment variable injection:
-* `APP_ENV`: Deployment runtime state (`development` / `production`).
-* `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`: PostgreSQL transaction cluster configurations.
-* `REDIS_ADDR`: Internal target network string for cache storage.
-* `JWT_SECRET_KEY`: High-entropy symmetric key used to parse and authenticate incoming client authorization contexts.
-* `RATE_LIMITER_URL`: Internal destination loopback address (`http://rate-limiter:8000/api/v1/is_allowed`) utilized to verify active consumer throttling frames out-of-band.
+* `APP_ENV`: Deployment runtime environment context (`local` / `production`). Defaults to `local`.
+* `APP_HOST`: The network address binding for the core application web service. Defaults to `localhost:8080`.
+* `DB_HOST`: Hostname or IP address of the primary PostgreSQL transaction cluster instance. Defaults to `localhost`.
+* `DB_PORT`: Port mapping allocation for the target PostgreSQL instance. Defaults to `5432`.
+* `DB_USER`: Authentication user profile namespace for database connectivity. Defaults to `postgres`.
+* `DB_PASS`: Authentication security string credential paired to the database user. Defaults to `postgres`.
+* `DB_NAME`: Target identity database namespace target within PostgreSQL. Defaults to `headsntails`.
+* `REDIS_ADDR`: Internal network endpoint address string for your standalone caching infrastructure instance. Defaults to `localhost:6379`.
+* `REDIS_PASSWORD`: Optional authentication secret token string verifying access rights into the Redis node cluster.
+* `REDIS_URL`: Premium TLS-secured string URL structure connection token utilized strictly when cloud provider architectures (e.g. Upstash) override default settings.
+* `REDIS_HASH_KEY`: Isolated tracking key space inside your Redis dictionary layout map. Defaults to `headsntails:v1:flags`.
+* `JWT_SECRET_KEY`: High-entropy symmetric validation secret key required to parse, deserialize, and verify incoming client authorization token parameters. **(Required)**
+* `RATE_LIMITER_URL`: Deep routing internal microservice location pointer endpoint utilized out-of-band to track active consumer resource limit calculations. **(Required)**
 
 ## Local Development Setup
 
