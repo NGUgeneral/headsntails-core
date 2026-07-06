@@ -15,6 +15,7 @@ import (
 
 	_ "headsntails-core/docs" // Dynamically generated package by 'swag init'
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	httpSwagger "github.com/swaggo/http-swagger/v2"
@@ -22,11 +23,18 @@ import (
 
 var ctx = context.Background()
 
+type PgxPoolIface interface {
+	Ping(ctx context.Context) error
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	Begin(ctx context.Context) (pgx.Tx, error)
+	Close()
+}
+
 type Engine struct {
 	mu           sync.RWMutex
 	flags        map[string]bool
 	rdb          *redis.Client
-	dbPool       *pgxpool.Pool
+	dbPool       PgxPoolIface
 	redisHashKey string
 }
 

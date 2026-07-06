@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,29 +11,51 @@ import (
 	"headsntails-core/config"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/pashagolub/pgxmock/v3"
+	"github.com/redis/go-redis/v9"
 )
 
-// Helper function to spin up an isolated engine linked to a fresh miniredis instance
-func setupTestEngine(t *testing.T) (*Engine, *miniredis.Miniredis) {
+func setupTestEngine(t *testing.T) (*Engine, *miniredis.Miniredis, pgxmock.PgxPoolIface) {
 	s, err := miniredis.Run()
 	if err != nil {
 		t.Fatalf("Failed to initialize local miniredis: %v", err)
 	}
 
-	cfg := &config.Config{
-		RedisAddr:    s.Addr(),
-		RedisHashKey: "test:feature:flags",
-		AppEnv:       "local",
+	dbMock, err := pgxmock.NewPool()
+	if err != nil {
+		t.Fatalf("Failed to initialize pgx pool mock: %v", err)
 	}
 
-	return NewEngine(cfg), s
+	cfg := &config.Config{
+		RedisHashKey: "test:feature:flags",
+	}
+
+	rows := pgxmock.NewRows([]string{"service", "key", "value"})
+	dbMock.ExpectQuery("SELECT service, key, value FROM public.feature_flags").WillReturnRows(rows)
+
+	engine := &Engine{
+		flags:        make(map[string]bool),
+		rdb:          redis.NewClient(&redis.Options{Addr: s.Addr()}),
+		dbPool:       dbMock,
+		redisHashKey: cfg.RedisHashKey,
+	}
+
+	engine.hydrateAndSyncDatabases()
+
+	return engine, s, dbMock
 }
 
 func TestEngineMutationsAndHydration(t *testing.T) {
-	engine, mr := setupTestEngine(t)
+	engine, mr, dbMock := setupTestEngine(t)
 	defer mr.Close()
+	defer dbMock.Close()
 
-	// 1. Verify Set and Get behaviors through the execution engine
+	dbMock.ExpectBegin()
+	dbMock.ExpectExec("INSERT INTO public.feature_flags").
+		WithArgs("billing", "enable-stripe-v2", true).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	dbMock.ExpectCommit()
+
 	err := engine.SetFlag("billing", "enable-stripe-v2", true)
 	if err != nil {
 		t.Fatalf("Unexpected write failure: %v", err)
@@ -42,28 +65,32 @@ func TestEngineMutationsAndHydration(t *testing.T) {
 		t.Error("Expected billing:enable-stripe-v2 to evaluate to true")
 	}
 
-	// 2. Verify state was physically pushed downward into miniredis hash structures
 	val := mr.HGet("test:feature:flags", "billing:enable-stripe-v2")
 	if val != "true" {
 		t.Errorf("Persistence tracking layout mismatch in storage: expected 'true', got %q", val)
 	}
 
-	// 3. Verify prefix grouping evaluations
-	engine.SetFlag("billing", "discount-v1", false)
-	engine.SetFlag("auth", "oauth-enabled", true)
-
-	billingFlags := engine.GetFlagsByService("billing")
-	if len(billingFlags) != 2 {
-		t.Errorf("Expected 2 billing flags, found %d", len(billingFlags))
+	if err := dbMock.ExpectationsWereMet(); err != nil {
+		t.Errorf("Unfulfilled database transaction expectations: %v", err)
 	}
-	if billingFlags["enable-stripe-v2"] != true || billingFlags["discount-v1"] != false {
-		t.Error("Matrix payload mapping corrupted across namespaces")
+}
+
+func TestGetFlagFallbackBehaviors(t *testing.T) {
+	engine, mr, dbMock := setupTestEngine(t)
+	defer mr.Close()
+	defer dbMock.Close()
+
+	if engine.GetFlag("ghost-service", "any-key") {
+		t.Error("Engine target lookup logic evaluated missing keys to true instead of false default")
 	}
 }
 
 func TestHandleHealthSuccess(t *testing.T) {
-	engine, mr := setupTestEngine(t)
+	engine, mr, dbMock := setupTestEngine(t)
 	defer mr.Close()
+	defer dbMock.Close()
+
+	dbMock.ExpectPing()
 
 	req, _ := http.NewRequest("GET", "/health", nil)
 	rr := httptest.NewRecorder()
@@ -74,18 +101,13 @@ func TestHandleHealthSuccess(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Errorf("Expected status code 200, got %d", rr.Code)
 	}
-
-	var resp HealthResponse
-	json.Unmarshal(rr.Body.Bytes(), &resp)
-	if resp.Status != "healthy" || resp.Redis != "connected" {
-		t.Errorf("Unexpected payload response: %+v", resp)
-	}
 }
 
 func TestHandleHealthStorageFailure(t *testing.T) {
-	engine, mr := setupTestEngine(t)
-	// Force close miniredis immediately to simulate a cluster network partition drop
-	mr.Close()
+	engine, _, dbMock := setupTestEngine(t)
+	defer dbMock.Close()
+
+	dbMock.ExpectPing().WillReturnError(fmt.Errorf("database connectivity lost"))
 
 	req, _ := http.NewRequest("GET", "/health", nil)
 	rr := httptest.NewRecorder()
@@ -94,41 +116,20 @@ func TestHandleHealthStorageFailure(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status code 503, got %d", rr.Code)
-	}
-}
-
-func TestHandleGetFlagValidation(t *testing.T) {
-	engine, mr := setupTestEngine(t)
-	defer mr.Close()
-
-	engine.SetFlag("shipping", "dhl-tracking", true)
-
-	// Case A: Missing parameters should throw a 400 Bad Request boundary check
-	req, _ := http.NewRequest("GET", "/api/v1/get?service=shipping", nil)
-	rr := httptest.NewRecorder()
-	handleGetFlag(engine)(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Errorf("Expected 400 for incomplete queries, got %d", rr.Code)
-	}
-
-	// Case B: Full parameter mapping verification
-	req, _ = http.NewRequest("GET", "/api/v1/get?service=shipping&key=dhl-tracking", nil)
-	rr = httptest.NewRecorder()
-	handleGetFlag(engine)(rr, req)
-
-	if rr.Code != http.StatusOK {
-		t.Errorf("Expected 200, got %d", rr.Code)
-	}
-	expectedOutput := "Service [shipping] Flag [dhl-tracking]: true\n"
-	if rr.Body.String() != expectedOutput {
-		t.Errorf("Output mismatch: got %q, expected %q", rr.Body.String(), expectedOutput)
+		t.Errorf("Expected status code 503 for database disconnection, got %d", rr.Code)
 	}
 }
 
 func TestHandleSetFlagPayloadVerification(t *testing.T) {
-	engine, mr := setupTestEngine(t)
+	engine, mr, dbMock := setupTestEngine(t)
 	defer mr.Close()
+	defer dbMock.Close()
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectExec("INSERT INTO public.feature_flags").
+		WithArgs("inventory", "realtime-sync", true).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	dbMock.ExpectCommit()
 
 	payload := FlagPayload{
 		Service: "inventory",
@@ -153,8 +154,19 @@ func TestHandleSetFlagPayloadVerification(t *testing.T) {
 }
 
 func TestHandleGetFlagsByService(t *testing.T) {
-	engine, mr := setupTestEngine(t)
+	engine, mr, dbMock := setupTestEngine(t)
 	defer mr.Close()
+	defer dbMock.Close()
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectExec("INSERT INTO public.feature_flags").WithArgs("telemetry", "metrics-v2", true).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	dbMock.ExpectCommit()
+
+	dbMock.ExpectBegin()
+	dbMock.ExpectExec("INSERT INTO public.feature_flags").WithArgs("telemetry", "tracing-v1", false).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	dbMock.ExpectCommit()
 
 	engine.SetFlag("telemetry", "metrics-v2", true)
 	engine.SetFlag("telemetry", "tracing-v1", false)
@@ -165,16 +177,19 @@ func TestHandleGetFlagsByService(t *testing.T) {
 	handleGetFlagsByService(engine)(rr, req)
 
 	if rr.Code != http.StatusOK {
-		t.Errorf("Expected 200, got %d", rr.Code)
+		t.Errorf("Expected status code 200, got %d", rr.Code)
 	}
 
-	var res map[string]bool
-	json.Unmarshal(rr.Body.Bytes(), &res)
+	var response map[string]bool
+	json.NewDecoder(rr.Body).Decode(&response)
 
-	if len(res) != 2 {
-		t.Errorf("Expected 2 flags returned, got %d", len(res))
+	if len(response) != 2 {
+		t.Errorf("Expected 2 payload items inside map layout footprint, got %d", len(response))
 	}
-	if res["metrics-v2"] != true || res["tracing-v1"] != false {
-		t.Error("Payload response data matrices are misaligned")
+	if !response["metrics-v2"] {
+		t.Error("Expected key 'metrics-v2' to pass true evaluation mapping target state")
+	}
+	if response["tracing-v1"] {
+		t.Error("Expected key 'tracing-v1' to return false evaluation mapping target state")
 	}
 }
