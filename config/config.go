@@ -1,119 +1,87 @@
 package config
 
 import (
-	"context"
+	"fmt"
 	"log"
 	"os"
-	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/joho/godotenv"
 )
 
 type Config struct {
-	AppEnv          string
-	AppHost         string
-	JwtSecretKey    string
-	JwtAlgorithm    string
-	TargetAwsRegion string
-	RedisAddr       string
-	RedisPassword   string
-	RedisURL        string
-	RedisHashKey    string
-	RateLimiterURL  string
+	AppEnv       string
+	AppHost      string
+	JwtSecretKey string
+	JwtAlgorithm string
+
+	// Redis Parameters
+	RedisAddr     string
+	RedisPassword string
+	RedisURL      string
+	RedisHashKey  string
+
+	// PostgreSQL Parameters
+	DBHost string
+	DBPort string
+	DBUser string
+	DBPass string
+	DBName string
+
+	// External Services
+	RateLimiterURL string
 }
 
 func LoadConfig() *Config {
-	appEnv := os.Getenv("APP_ENV")
-	if appEnv == "" {
-		appEnv = "local"
-	}
-
-	appHost := os.Getenv("APP_HOST")
-	if appHost == "" {
-		appHost = "localhost:8080"
-	}
-
+	appEnv := getEnv("APP_ENV", "local")
 	if appEnv != "production" {
 		if err := godotenv.Load(); err != nil {
 			log.Println("⚠️ No .env file discovered; falling back to native environment variables.")
 		}
 	}
 
-	algorithm := os.Getenv("JWT_ALGORITHM")
-	if algorithm == "" {
-		algorithm = "HS256"
+	cfg := &Config{
+		AppEnv:       appEnv,
+		AppHost:      getEnv("APP_HOST", "localhost:8080"),
+		JwtAlgorithm: getEnv("JWT_ALGORITHM", "HS256"),
+
+		RedisAddr:     getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisPassword: os.Getenv("REDIS_PASSWORD"),
+		RedisURL:      os.Getenv("REDIS_URL"),
+		RedisHashKey:  getEnv("REDIS_HASH_KEY", "headsntails:v1:flags"),
+
+		DBHost: getEnv("DB_HOST", "localhost"),
+		DBPort: getEnv("DB_PORT", "5432"),
+		DBUser: getEnv("DB_USER", "postgres"),
+		DBPass: getEnv("DB_PASS", "postgres"),
+		DBName: getEnv("DB_NAME", "headsntails"),
+
+		RateLimiterURL: os.Getenv("RATE_LIMITER_URL"),
+		JwtSecretKey:   os.Getenv("JWT_SECRET_KEY"),
 	}
 
-	region := os.Getenv("TARGET_AWS_REGION")
-	if region == "" {
-		region = "eu-central-1"
-	}
+	cfg.validateRequiredFields()
 
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
+	return cfg
+}
 
-	redisPassword := os.Getenv("REDIS_PASSWORD")
+func (c *Config) GetPostgresConnectionString() string {
+	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
+		c.DBUser, c.DBPass, c.DBHost, c.DBPort, c.DBName,
+	)
+}
 
-	redisURL := os.Getenv("REDIS_URL")
-
-	redisHashKey := os.Getenv("REDIS_HASH_KEY")
-	if redisHashKey == "" {
-		redisHashKey = "headsntails:v1:flags"
-	}
-
-	rateLimiterURL := os.Getenv("RATE_LIMITER_URL")
-	if rateLimiterURL == "" {
+func (c *Config) validateRequiredFields() {
+	if c.RateLimiterURL == "" {
 		log.Fatal("CRITICAL: RATE_LIMITER_URL environment variable is required but not set!")
 	}
-
-	var secret string
-
-	if appEnv == "production" {
-		log.Println("☁️ Production environment detected. Fetching secrets from AWS Parameter Store...")
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		awsCfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
-		if err != nil {
-			log.Fatalf("CRITICAL: Unable to load AWS SDK config footprint: %v", err)
-		}
-
-		ssmClient := ssm.NewFromConfig(awsCfg)
-		paramName := "/headsntails-core/prod/jwt-secret"
-
-		out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
-			Name:           &paramName,
-			WithDecryption: aws.Bool(true),
-		})
-		if err != nil {
-			log.Fatalf("CRITICAL: headsntails failed to load production secret from SSM Parameter Store: %v", err)
-		}
-
-		secret = *out.Parameter.Value
-		log.Println("✅ Successfully loaded production JWT secret from AWS Systems Manager.")
-	} else {
-		secret = os.Getenv("JWT_SECRET_KEY")
-		if secret == "" {
-			log.Fatal("CRITICAL: JWT_SECRET_KEY environment variable is missing for local development!")
-		}
+	if c.JwtSecretKey == "" {
+		log.Fatal("CRITICAL: JWT_SECRET_KEY environment variable is required but not set!")
 	}
+}
 
-	return &Config{
-		AppEnv:          appEnv,
-		AppHost:         appHost,
-		JwtSecretKey:    secret,
-		JwtAlgorithm:    algorithm,
-		TargetAwsRegion: region,
-		RedisAddr:       redisAddr,
-		RedisPassword:   redisPassword,
-		RedisURL:        redisURL,
-		RedisHashKey:    redisHashKey,
-		RateLimiterURL:  rateLimiterURL,
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
 	}
+	return fallback
 }
