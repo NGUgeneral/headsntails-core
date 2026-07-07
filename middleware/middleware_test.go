@@ -118,8 +118,8 @@ func TestResolveClientIP_ProxyHeaderMatching(t *testing.T) {
 }
 
 func TestRateLimitGuard_MockHTTPClientPassThrough(t *testing.T) {
-	// Spin up a fast mock HTTP server that simulates your AWS Lambda Rate Limiter cluster returning an 'allowed' state
-	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { // <-- FIXED HERE
+	// Spin up a fast mock HTTP server that simulates your Rate Limiter service returning an 'allowed' state
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]interface{}{
@@ -131,11 +131,8 @@ func TestRateLimitGuard_MockHTTPClientPassThrough(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	// Initialize the custom client client mapped directly to our local mock instance
-	client := &RateLimiterClient{
-		httpClient:  &http.Client{Timeout: time.Second},
-		endpointURL: mockServer.URL,
-	}
+	// ─── UPDATED: Instantiate the new HTTP strategy implementation interface wrapper ───
+	strategy := NewHTTPRateLimiter(mockServer.URL, time.Second)
 
 	req, _ := http.NewRequest(http.MethodGet, "/resource", nil)
 	// Inject a dummy token string context so it hits the token limiting path condition block
@@ -143,7 +140,8 @@ func TestRateLimitGuard_MockHTTPClientPassThrough(t *testing.T) {
 	req = req.WithContext(ctx)
 
 	rr := httptest.NewRecorder()
-	handler := RateLimitGuard(client, time.Second)(nextHandler())
+	// Pass the configured strategy container directly into the unified guard interceptor
+	handler := RateLimitGuard(strategy, time.Second)(nextHandler())
 	handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
