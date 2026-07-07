@@ -263,10 +263,28 @@ func main() {
 	http.HandleFunc("/health", handleHealth(engine))
 
 	// --- AUTOMATED INTERACTIVE DOCUMENTATION TESTBENCH ---
-	docs.SwaggerInfo.Host = cfg.AppHost
 	http.Handle("/docs/", httpSwagger.Handler(httpSwagger.URL("/docs/doc.json")))
 	http.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
+	})
+
+	http.HandleFunc("/docs/doc.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// 1. Clear Host so Swagger UI auto-locks to the browser origin (localhost:80)
+		docs.SwaggerInfo.Host = ""
+		docs.SwaggerInfo.Schemes = []string{"http", "https"}
+
+		// 2. Set BasePath to match Nginx's incoming public ingress prefix routing route
+		docs.SwaggerInfo.BasePath = "/api/v1/flags"
+
+		var rawSpec interface{}
+		if err := json.Unmarshal([]byte(docs.SwaggerInfo.ReadDoc()), &rawSpec); err != nil {
+			http.Error(w, "Failed to build spec layout schema", http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(rawSpec)
 	})
 
 	// --- PROTECTED ROUTING WITH INLINE DEFENSIVE RATE LIMITING ---
