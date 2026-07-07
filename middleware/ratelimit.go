@@ -8,7 +8,16 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	ratelimitv1 "headsntails-core/proto/ratelimit/v1"
+
+	"google.golang.org/grpc"
 )
+
+// RateLimiterStrategy abstracts the transport layer entirely from the HTTP middleware interceptor
+type RateLimiterStrategy interface {
+	IsAllowed(ctx context.Context, reqBody *RateCheckRequest) bool
+}
 
 // RateCheckRequest matches the Pydantic V2 model expected by Phase 1
 type RateCheckRequest struct {
@@ -31,12 +40,6 @@ type FastAPIErrorResponse struct {
 	Detail json.RawMessage `json:"detail"`
 }
 
-// RateLimiterClient handles optimized outbound execution to the AWS Lambda service layer
-type RateLimiterClient struct {
-	httpClient  *http.Client
-	endpointURL string
-}
-
 // RateLimiterErrorDetail maps the internal 429 error structure from Phase 1
 type RateLimiterErrorDetail struct {
 	Message      string `json:"message" example:"Rate limit exceeded"`
@@ -54,9 +57,18 @@ type RateCheck400Response struct {
 	Detail string `json:"detail" example:"Token-authenticated requests must explicitly supply limit and window metrics."`
 }
 
-// NewRateLimiterClient instantiates a client configured with aggressive connection pooling
-func NewRateLimiterClient(endpointURL string, timeout time.Duration) *RateLimiterClient {
-	return &RateLimiterClient{
+// ────────────────────────────────────────────────────────
+// 1. HTTP STRATEGY IMPLEMENTATION
+// ────────────────────────────────────────────────────────
+
+type HTTPRateLimiter struct {
+	httpClient  *http.Client
+	endpointURL string
+}
+
+// NewHTTPRateLimiter instantiates an HTTP strategy client configured with aggressive connection pooling
+func NewHTTPRateLimiter(endpointURL string, timeout time.Duration) *HTTPRateLimiter {
+	return &HTTPRateLimiter{
 		endpointURL: endpointURL,
 		httpClient: &http.Client{
 			Timeout: timeout,
@@ -76,24 +88,23 @@ func NewRateLimiterClient(endpointURL string, timeout time.Duration) *RateLimite
 	}
 }
 
-// IsAllowed executes the remote rate-check call, defaulting to true (FAIL-OPEN) on any unexpected failure
-func (c *RateLimiterClient) IsAllowed(ctx context.Context, reqBody *RateCheckRequest) bool {
+func (h *HTTPRateLimiter) IsAllowed(ctx context.Context, reqBody *RateCheckRequest) bool {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
-		log.Printf("[RATE-LIMITER] Error marshaling request payload: %v. Defaulting to FAIL-OPEN.", err)
+		log.Printf("[RATE-LIMITER-HTTP] Error marshaling request payload: %v. Defaulting to FAIL-OPEN.", err)
 		return true
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpointURL, bytes.NewBuffer(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.endpointURL, bytes.NewBuffer(payload))
 	if err != nil {
-		log.Printf("[RATE-LIMITER] Error creating HTTP request context: %v. Defaulting to FAIL-OPEN.", err)
+		log.Printf("[RATE-LIMITER-HTTP] Error creating HTTP request context: %v. Defaulting to FAIL-OPEN.", err)
 		return true
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
+	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[RATE-LIMITER] Request failed or timed out: %v. Defaulting to FAIL-OPEN.", err)
+		log.Printf("[RATE-LIMITER-HTTP] Request failed or timed out: %v. Defaulting to FAIL-OPEN.", err)
 		return true
 	}
 	defer resp.Body.Close()
@@ -102,7 +113,7 @@ func (c *RateLimiterClient) IsAllowed(ctx context.Context, reqBody *RateCheckReq
 	if resp.StatusCode == http.StatusOK {
 		var successResp RateCheckSuccessResponse
 		if err := json.NewDecoder(resp.Body).Decode(&successResp); err != nil {
-			log.Printf("[RATE-LIMITER] Error decoding 200 OK success payload: %v. Defaulting to FAIL-OPEN.", err)
+			log.Printf("[RATE-LIMITER-HTTP] Error decoding 200 OK success payload: %v. Defaulting to FAIL-OPEN.", err)
 			return true
 		}
 		return successResp.Status == "allowed"
@@ -112,9 +123,9 @@ func (c *RateLimiterClient) IsAllowed(ctx context.Context, reqBody *RateCheckReq
 	if resp.StatusCode == http.StatusTooManyRequests {
 		var errResp FastAPIErrorResponse
 		if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
-			log.Printf("[RATE-LIMITER] Blocked: 429 Rate Limit Exceeded. Detail Matrix: %s", string(errResp.Detail))
+			log.Printf("[RATE-LIMITER-HTTP] Blocked: 429 Rate Limit Exceeded. Detail Matrix: %s", string(errResp.Detail))
 		} else {
-			log.Printf("[RATE-LIMITER] Blocked: 429 Rate Limit Exceeded (Failed to parse detail metadata payload).")
+			log.Printf("[RATE-LIMITER-HTTP] Blocked: 429 Rate Limit Exceeded (Failed to parse detail metadata payload).")
 		}
 		return false
 	}
@@ -122,13 +133,64 @@ func (c *RateLimiterClient) IsAllowed(ctx context.Context, reqBody *RateCheckReq
 	// Handle 400 Bad Request and all other non-200/429 states (Fail Open to safeguard experience)
 	var errResp FastAPIErrorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
-		log.Printf("[RATE-LIMITER] Alert: Upstream returned HTTP status %d. Detail: %s. Defaulting to FAIL-OPEN.", resp.StatusCode, string(errResp.Detail))
+		log.Printf("[RATE-LIMITER-HTTP] Alert: Upstream returned HTTP status %d. Detail: %s. Defaulting to FAIL-OPEN.", resp.StatusCode, string(errResp.Detail))
 	} else {
-		log.Printf("[RATE-LIMITER] Alert: Upstream returned HTTP status %d. Defaulting to FAIL-OPEN.", resp.StatusCode)
+		log.Printf("[RATE-LIMITER-HTTP] Alert: Upstream returned HTTP status %d. Defaulting to FAIL-OPEN.", resp.StatusCode)
 	}
 
 	return true
 }
+
+// ────────────────────────────────────────────────────────
+// 2. GRPC STRATEGY IMPLEMENTATION
+// ────────────────────────────────────────────────────────
+
+type GRPCRateLimiter struct {
+	grpcClient ratelimitv1.RateLimiterServiceClient
+}
+
+// NewGRPCRateLimiter instantiates a gRPC strategy using an active client connection wrapper
+func NewGRPCRateLimiter(cc grpc.ClientConnInterface) *GRPCRateLimiter {
+	return &GRPCRateLimiter{
+		grpcClient: ratelimitv1.NewRateLimiterServiceClient(cc),
+	}
+}
+
+func (g *GRPCRateLimiter) IsAllowed(ctx context.Context, reqBody *RateCheckRequest) bool {
+	protoReq := &ratelimitv1.IsAllowedRequest{
+		IpKey: reqBody.IPKey,
+	}
+
+	if reqBody.AccessKey != nil {
+		protoReq.AccessKey = reqBody.AccessKey
+	}
+
+	if reqBody.Limit != nil {
+		limitVal := int32(*reqBody.Limit)
+		protoReq.Limit = &limitVal
+	}
+
+	if reqBody.Window != nil {
+		windowVal := int32(*reqBody.Window)
+		protoReq.Window = &windowVal
+	}
+
+	res, err := g.grpcClient.IsAllowed(ctx, protoReq)
+	if err != nil {
+		log.Printf("[RATE-LIMITER-GRPC] RPC call failed or timed out: %v. Defaulting to FAIL-OPEN.", err)
+		return true // Fail-open on internal gRPC channel/transport exceptions
+	}
+
+	if res.Status == "blocked" {
+		return false
+	}
+
+	return true
+}
+
+// ────────────────────────────────────────────────────────
+// 3. UNIFIED INFRASTRUCTURE LOGIC
+// ────────────────────────────────────────────────────────
 
 // ResolveClientIP sanitizes and extracts the public edge IP passed explicitly by upstream gateways
 func ResolveClientIP(r *http.Request) string {
@@ -144,8 +206,8 @@ func ResolveClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// RateLimitGuard creates the structural middleware layer interfacing with your engine control path
-func RateLimitGuard(client *RateLimiterClient, executionTimeout time.Duration) func(http.Handler) http.Handler {
+// RateLimitGuard creates the structural middleware layer interfacing with your chosen strategy control path
+func RateLimitGuard(strategy RateLimiterStrategy, executionTimeout time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			var accessKeyPtr *string
@@ -171,7 +233,7 @@ func RateLimitGuard(client *RateLimiterClient, executionTimeout time.Duration) f
 			limiterCtx, cancel := context.WithTimeout(r.Context(), executionTimeout)
 			defer cancel()
 
-			if !client.IsAllowed(limiterCtx, reqPayload) {
+			if !strategy.IsAllowed(limiterCtx, reqPayload) {
 				http.Error(w, "Too Many Requests: Rate limit exceeded or quota exhausted.", http.StatusTooManyRequests)
 				return
 			}

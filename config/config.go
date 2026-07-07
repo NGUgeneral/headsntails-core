@@ -28,7 +28,9 @@ type Config struct {
 	DBName string
 
 	// External Services
-	RateLimiterURL string
+	RateLimiterURL      string
+	RateLimiterGRPCURL  string
+	RateLimiterGRPCCall bool
 }
 
 func LoadConfig() *Config {
@@ -55,8 +57,10 @@ func LoadConfig() *Config {
 		DBPass: getEnv("DB_PASS", "postgres"),
 		DBName: getEnv("DB_NAME", "headsntails"),
 
-		RateLimiterURL: os.Getenv("RATE_LIMITER_URL"),
-		JwtSecretKey:   os.Getenv("JWT_SECRET_KEY"),
+		RateLimiterURL:      os.Getenv("RATE_LIMITER_URL"),
+		RateLimiterGRPCURL:  os.Getenv("RATE_LIMITER_GRPC_URL"),
+		RateLimiterGRPCCall: getEnv("RATE_LIMITER_GRPC_CALL", "false") == "true",
+		JwtSecretKey:        os.Getenv("JWT_SECRET_KEY"),
 	}
 
 	cfg.validateRequiredFields()
