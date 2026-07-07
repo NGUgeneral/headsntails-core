@@ -3,12 +3,19 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/test/bufconn"
+
+	ratelimitv1 "headsntails-core/proto/ratelimit/v1"
 )
 
 // Dummy ultimate destination handler to verify cascading execution flow
@@ -18,10 +25,6 @@ func nextHandler() http.Handler {
 		w.Write([]byte("success"))
 	})
 }
-
-// ============================================================================
-// 1. CORS Middleware Test Suite
-// ============================================================================
 
 func TestCORSEnforcer_OptionsPreflight(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodOptions, "/any-route", nil)
@@ -103,10 +106,6 @@ func TestAuthMiddleware_ValidTokenContextInjection(t *testing.T) {
 	}
 }
 
-// ============================================================================
-// 3. Rate Limit Middleware Boundary Test Suite
-// ============================================================================
-
 func TestResolveClientIP_ProxyHeaderMatching(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "/", nil)
 	req.Header.Set("X-Forwarded-For", " 192.168.1.50, 10.0.0.1 ")
@@ -146,5 +145,69 @@ func TestRateLimitGuard_MockHTTPClientPassThrough(t *testing.T) {
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("Expected request to pass cleanly, got fallback error code %d", rr.Code)
+	}
+}
+
+// MockRateLimiterServer implements the generated gRPC server stub interface
+type MockRateLimiterServer struct {
+	ratelimitv1.UnimplementedRateLimiterServiceServer
+	MockStatus string // "allowed" or "blocked"
+}
+
+func (m *MockRateLimiterServer) IsAllowed(ctx context.Context, req *ratelimitv1.IsAllowedRequest) (*ratelimitv1.IsAllowedResponse, error) {
+	return &ratelimitv1.IsAllowedResponse{
+		Status:       m.MockStatus,
+		CurrentCount: 1,
+		Limit:        10,
+		Remaining:    9,
+		Message:      nil,
+	}, nil
+}
+
+func TestRateLimitGuard_MockGRPCClientPassThrough(t *testing.T) {
+	const bufSize = 1024 * 1024
+	lis := bufconn.Listen(bufSize)
+	s := grpc.NewServer()
+
+	// 1. Instantiate our mock server state to return "allowed"
+	mockServer := &MockRateLimiterServer{MockStatus: "allowed"}
+	ratelimitv1.RegisterRateLimiterServiceServer(s, mockServer)
+
+	// Spin up the listener loop inside a background goroutine
+	go func() {
+		if err := s.Serve(lis); err != nil && err.Error() != "closed" {
+			log.Fatalf("Server exited with error: %v", err)
+		}
+	}()
+	defer s.GracefulStop()
+
+	// 2. Establish a non-blocking modern Client connection over the in-memory buffer channel
+	conn, err := grpc.NewClient("passthrough://bufconn",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return lis.Dial()
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Failed to dial bufconn: %v", err)
+	}
+	defer conn.Close()
+
+	// 3. Bind the active channel straight into your GRPCRateLimiter strategy container
+	strategy := NewGRPCRateLimiter(conn)
+
+	req, _ := http.NewRequest(http.MethodGet, "/resource", nil)
+	// Inject a dummy token string context so it evaluates the token limiting flow paths
+	reqCtx := context.WithValue(req.Context(), ContextAudienceKey, "test-grpc-client")
+	req = req.WithContext(reqCtx)
+
+	rr := httptest.NewRecorder()
+
+	// Execute the HTTP interceptor using the underlying gRPC strategy backend
+	handler := RateLimitGuard(strategy, time.Second)(nextHandler())
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("Expected request to pass cleanly through gRPC validation strategy, got %d", rr.Code)
 	}
 }
