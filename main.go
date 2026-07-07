@@ -9,11 +9,14 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
 	"headsntails-core/config"
 	"headsntails-core/docs"
 	"headsntails-core/middleware"
 
-	_ "headsntails-core/docs" // Dynamically generated package by 'swag init'
+	_ "headsntails-core/docs"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -239,9 +242,22 @@ func main() {
 	authGuard := middleware.AuthMiddleware(secretBytes, cfg.JwtAlgorithm)
 
 	const RateLimitTimeout = 40 * time.Millisecond
+	var limiterStrategy middleware.RateLimiterStrategy
 
-	limiterClient := middleware.NewRateLimiterClient(cfg.RateLimiterURL, RateLimitTimeout)
-	rateGuard := middleware.RateLimitGuard(limiterClient, RateLimitTimeout)
+	if cfg.RateLimiterGRPCCall {
+		conn, err := grpc.NewClient(cfg.RateLimiterGRPCURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Fatalf("[MAIN] Critical failure initializing Rate Limiter gRPC channel: %v", err)
+		}
+		limiterStrategy = middleware.NewGRPCRateLimiter(conn)
+		log.Printf("[MAIN] Rate Limiter initialized in high-performance gRPC mode targeting: %s", cfg.RateLimiterGRPCURL)
+	} else {
+		// Fall back to the default HTTP JSON endpoint path
+		limiterStrategy = middleware.NewHTTPRateLimiter(cfg.RateLimiterURL, RateLimitTimeout)
+		log.Printf("[MAIN] Rate Limiter initialized in standard HTTP mode targeting: %s", cfg.RateLimiterURL)
+	}
+
+	rateGuard := middleware.RateLimitGuard(limiterStrategy, RateLimitTimeout)
 
 	// --- PUBLIC ROUTING ---
 	http.HandleFunc("/health", handleHealth(engine))
