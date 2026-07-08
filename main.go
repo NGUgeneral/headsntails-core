@@ -241,10 +241,10 @@ func main() {
 	secretBytes := []byte(cfg.JwtSecretKey)
 	authGuard := middleware.AuthMiddleware(secretBytes, cfg.JwtAlgorithm)
 
-	const RateLimitTimeout = 40 * time.Millisecond
+	RateLimitTimeout := time.Duration(cfg.RateLimiterHTTPTimeoutMS) * time.Millisecond
 	var limiterStrategy middleware.RateLimiterStrategy
 
-	if cfg.RateLimiterGRPCCall {
+	if cfg.RateLimiterUseGRPC {
 		conn, err := grpc.NewClient(cfg.RateLimiterGRPCURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 		if err != nil {
 			log.Fatalf("[MAIN] Critical failure initializing Rate Limiter gRPC channel: %v", err)
@@ -257,7 +257,7 @@ func main() {
 		log.Printf("[MAIN] Rate Limiter initialized in standard HTTP mode targeting: %s", cfg.RateLimiterURL)
 	}
 
-	rateGuard := middleware.RateLimitGuard(limiterStrategy, RateLimitTimeout)
+	rateGuard := middleware.RateLimitGuard(limiterStrategy, RateLimitTimeout, cfg)
 
 	// --- PUBLIC ROUTING ---
 	http.HandleFunc("/health", handleHealth(engine))

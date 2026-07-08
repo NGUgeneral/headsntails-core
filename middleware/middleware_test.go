@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"headsntails-core/config"
+
 	"github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -51,6 +53,13 @@ func TestCORSEnforcer_StandardPassThrough(t *testing.T) {
 
 	if rr.Code != http.StatusOK || rr.Body.String() != "success" {
 		t.Error("CORS failed to forward execution control down the handler stack")
+	}
+}
+
+func NewTestConfig() *config.Config {
+	return &config.Config{
+		TokenBasedRateLimit:       1000,
+		TokenBasedRateLimitWindow: 60,
 	}
 }
 
@@ -139,8 +148,9 @@ func TestRateLimitGuard_MockHTTPClientPassThrough(t *testing.T) {
 	req = req.WithContext(ctx)
 
 	rr := httptest.NewRecorder()
+	mockCfg := NewTestConfig()
 	// Pass the configured strategy container directly into the unified guard interceptor
-	handler := RateLimitGuard(strategy, time.Second)(nextHandler())
+	handler := RateLimitGuard(strategy, time.Second, mockCfg)(nextHandler())
 	handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {
@@ -202,9 +212,9 @@ func TestRateLimitGuard_MockGRPCClientPassThrough(t *testing.T) {
 	req = req.WithContext(reqCtx)
 
 	rr := httptest.NewRecorder()
-
+	mockCfg := NewTestConfig()
 	// Execute the HTTP interceptor using the underlying gRPC strategy backend
-	handler := RateLimitGuard(strategy, time.Second)(nextHandler())
+	handler := RateLimitGuard(strategy, time.Second, mockCfg)(nextHandler())
 	handler.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusOK {

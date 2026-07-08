@@ -5,6 +5,8 @@ import (
 	"log"
 	"os"
 
+	"strconv"
+
 	"github.com/joho/godotenv"
 )
 
@@ -28,9 +30,12 @@ type Config struct {
 	DBName string
 
 	// External Services
-	RateLimiterURL      string
-	RateLimiterGRPCURL  string
-	RateLimiterGRPCCall bool
+	RateLimiterURL            string
+	RateLimiterGRPCURL        string
+	RateLimiterUseGRPC        bool
+	RateLimiterHTTPTimeoutMS  int
+	TokenBasedRateLimit       int
+	TokenBasedRateLimitWindow int
 }
 
 func LoadConfig() *Config {
@@ -57,10 +62,13 @@ func LoadConfig() *Config {
 		DBPass: getEnv("DB_PASS", "postgres"),
 		DBName: getEnv("DB_NAME", "headsntails"),
 
-		RateLimiterURL:      os.Getenv("RATE_LIMITER_URL"),
-		RateLimiterGRPCURL:  os.Getenv("RATE_LIMITER_GRPC_URL"),
-		RateLimiterGRPCCall: getEnv("RATE_LIMITER_GRPC_CALL", "false") == "true",
-		JwtSecretKey:        os.Getenv("JWT_SECRET_KEY"),
+		RateLimiterURL:            os.Getenv("RATE_LIMITER_URL"),
+		RateLimiterGRPCURL:        os.Getenv("RATE_LIMITER_GRPC_URL"),
+		RateLimiterUseGRPC:        getEnvBool("RATE_LIMITER_USE_GRPC", false),
+		RateLimiterHTTPTimeoutMS:  getEnvInt("RATE_LIMITER_HTTP_TIMEOUT_MS", 100),
+		TokenBasedRateLimit:       getEnvInt("TOKEN_BASED_RATE_LIMIT", 1000),
+		TokenBasedRateLimitWindow: getEnvInt("TOKEN_BASED_RATE_LIMIT_WINDOW", 60),
+		JwtSecretKey:              os.Getenv("JWT_SECRET_KEY"),
 	}
 
 	cfg.validateRequiredFields()
@@ -86,6 +94,24 @@ func (c *Config) validateRequiredFields() {
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if valueStr, exists := os.LookupEnv(key); exists {
+		if value, err := strconv.Atoi(valueStr); err == nil {
+			return value
+		}
+	}
+	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if valueStr, exists := os.LookupEnv(key); exists {
+		if value, err := strconv.ParseBool(valueStr); err == nil {
+			return value
+		}
 	}
 	return fallback
 }
