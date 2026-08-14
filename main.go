@@ -15,6 +15,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 
 	"headsntails-core/config"
 	"headsntails-core/docs"
@@ -314,7 +315,13 @@ func main() {
 		log.Fatalf("CRITICAL: Failed to listen on gRPC SDK port %s: %v", grpcPort, err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			middleware.AuthUnaryInterceptor(secretBytes, cfg.JwtAlgorithm),
+			middleware.RateLimitUnaryInterceptor(limiterStrategy, RateLimitTimeout, cfg),
+		),
+	)
+	reflection.Register(grpcServer)
 	flagService := NewFlagServiceServer(engine)
 	sdk.RegisterFlagServiceServer(grpcServer, flagService)
 
