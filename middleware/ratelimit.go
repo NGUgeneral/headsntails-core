@@ -13,9 +13,13 @@ import (
 	ratelimitv1 "headsntails-core/proto/ratelimit/v1"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
-// RateLimiterStrategy abstracts the transport layer entirely from the HTTP middleware interceptor
+// RateLimiterStrategy abstracts the outbound transport layer (HTTP vs gRPC)
 type RateLimiterStrategy interface {
 	IsAllowed(ctx context.Context, reqBody *RateCheckRequest) bool
 }
@@ -60,7 +64,114 @@ type RateCheck400Response struct {
 }
 
 // ────────────────────────────────────────────────────────
-// 1. HTTP STRATEGY IMPLEMENTATION
+// 1. CORE DOMAIN EVALUATOR (Pure Go Function)
+// ────────────────────────────────────────────────────────
+
+// EvaluateRateLimit centralizes payload construction and config overrides.
+// It is completely protocol-agnostic and relies purely on basic Go types.
+func EvaluateRateLimit(ctx context.Context, strategy RateLimiterStrategy, cfg *config.Config, ipKey string, accessKey *string) bool {
+	reqPayload := &RateCheckRequest{
+		AccessKey: accessKey,
+		IPKey:     ipKey,
+	}
+
+	// Apply config defaults when an access key is present
+	if reqPayload.AccessKey != nil {
+		limit := cfg.TokenBasedRateLimit
+		window := cfg.TokenBasedRateLimitWindow
+		reqPayload.Limit = &limit
+		reqPayload.Window = &window
+	}
+
+	return strategy.IsAllowed(ctx, reqPayload)
+}
+
+// ────────────────────────────────────────────────────────
+// 2. INGRESS ADAPTERS (HTTP Middleware & gRPC Interceptor)
+// ────────────────────────────────────────────────────────
+
+// ResolveClientIP sanitizes and extracts the public edge IP passed explicitly by upstream gateways
+func ResolveClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := bytes.Split([]byte(xff), []byte(","))
+		if len(parts) > 0 {
+			return string(bytes.TrimSpace(parts[0]))
+		}
+	}
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
+
+// RateLimitGuard creates the HTTP middleware layer
+func RateLimitGuard(strategy RateLimiterStrategy, executionTimeout time.Duration, cfg *config.Config) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var accessKeyPtr *string
+			if aud, ok := r.Context().Value(ContextAudienceKey).(string); ok && aud != "" {
+				accessKeyPtr = &aud
+			}
+
+			ipKey := ResolveClientIP(r)
+
+			limiterCtx, cancel := context.WithTimeout(r.Context(), executionTimeout)
+			defer cancel()
+
+			if !EvaluateRateLimit(limiterCtx, strategy, cfg, ipKey, accessKeyPtr) {
+				http.Error(w, "Too Many Requests: Rate limit exceeded or quota exhausted.", http.StatusTooManyRequests)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// ResolveGRPCClientIP extracts the client IP address from gRPC metadata or socket peer info
+func ResolveGRPCClientIP(ctx context.Context) string {
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if xff := md.Get("x-forwarded-for"); len(xff) > 0 && xff[0] != "" {
+			parts := bytes.Split([]byte(xff[0]), []byte(","))
+			if len(parts) > 0 {
+				return string(bytes.TrimSpace(parts[0]))
+			}
+		}
+	}
+
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		if ip, _, err := net.SplitHostPort(p.Addr.String()); err == nil {
+			return ip
+		}
+		return p.Addr.String()
+	}
+
+	return "unknown"
+}
+
+// RateLimitUnaryInterceptor creates the gRPC unary server interceptor
+func RateLimitUnaryInterceptor(strategy RateLimiterStrategy, executionTimeout time.Duration, cfg *config.Config) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		var accessKeyPtr *string
+		if aud, ok := ctx.Value(ContextAudienceKey).(string); ok && aud != "" {
+			accessKeyPtr = &aud
+		}
+
+		ipKey := ResolveGRPCClientIP(ctx)
+
+		limiterCtx, cancel := context.WithTimeout(ctx, executionTimeout)
+		defer cancel()
+
+		if !EvaluateRateLimit(limiterCtx, strategy, cfg, ipKey, accessKeyPtr) {
+			return nil, status.Error(codes.ResourceExhausted, "Rate limit exceeded or quota exhausted.")
+		}
+
+		return handler(ctx, req)
+	}
+}
+
+// ────────────────────────────────────────────────────────
+// 3. OUTBOUND STRATEGY IMPLEMENTATIONS (HTTP & gRPC)
 // ────────────────────────────────────────────────────────
 
 type HTTPRateLimiter struct {
@@ -68,7 +179,6 @@ type HTTPRateLimiter struct {
 	endpointURL string
 }
 
-// NewHTTPRateLimiter instantiates an HTTP strategy client configured with aggressive connection pooling
 func NewHTTPRateLimiter(endpointURL string, timeout time.Duration) *HTTPRateLimiter {
 	return &HTTPRateLimiter{
 		endpointURL: endpointURL,
@@ -135,7 +245,6 @@ func (h *HTTPRateLimiter) IsAllowed(ctx context.Context, reqBody *RateCheckReque
 		return false
 	}
 
-	// Handle 400 Bad Request and all other non-200/429 states (Fail Open to safeguard experience)
 	var errResp FastAPIErrorResponse
 	if err := json.NewDecoder(resp.Body).Decode(&errResp); err == nil {
 		log.Printf("[RATE-LIMITER-HTTP] Alert: Upstream returned HTTP status %d. Detail: %s. Defaulting to FAIL-OPEN.", resp.StatusCode, string(errResp.Detail))
@@ -146,15 +255,10 @@ func (h *HTTPRateLimiter) IsAllowed(ctx context.Context, reqBody *RateCheckReque
 	return true
 }
 
-// ────────────────────────────────────────────────────────
-// 2. GRPC STRATEGY IMPLEMENTATION
-// ────────────────────────────────────────────────────────
-
 type GRPCRateLimiter struct {
 	grpcClient ratelimitv1.RateLimiterServiceClient
 }
 
-// NewGRPCRateLimiter instantiates a gRPC strategy using an active client connection wrapper
 func NewGRPCRateLimiter(cc grpc.ClientConnInterface) *GRPCRateLimiter {
 	return &GRPCRateLimiter{
 		grpcClient: ratelimitv1.NewRateLimiterServiceClient(cc),
@@ -194,59 +298,4 @@ func (g *GRPCRateLimiter) IsAllowed(ctx context.Context, reqBody *RateCheckReque
 	}
 
 	return true
-}
-
-// ────────────────────────────────────────────────────────
-// 3. UNIFIED INFRASTRUCTURE LOGIC
-// ────────────────────────────────────────────────────────
-
-// ResolveClientIP sanitizes and extracts the public edge IP passed explicitly by upstream gateways
-func ResolveClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := bytes.Split([]byte(xff), []byte(","))
-		if len(parts) > 0 {
-			return string(bytes.TrimSpace(parts[0]))
-		}
-	}
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return ip
-	}
-	return r.RemoteAddr
-}
-
-// RateLimitGuard creates the structural middleware layer interfacing with your chosen strategy control path
-func RateLimitGuard(strategy RateLimiterStrategy, executionTimeout time.Duration, cfg *config.Config) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var accessKeyPtr *string
-			if aud, ok := r.Context().Value(ContextAudienceKey).(string); ok && aud != "" {
-				accessKeyPtr = &aud
-			}
-
-			ipKey := ResolveClientIP(r)
-
-			reqPayload := &RateCheckRequest{
-				AccessKey: accessKeyPtr,
-				IPKey:     ipKey,
-			}
-
-			// Token-Based Strategy configuration tracking metrics
-			if reqPayload.AccessKey != nil {
-				limit := cfg.TokenBasedRateLimit
-				window := cfg.TokenBasedRateLimitWindow
-				reqPayload.Limit = &limit
-				reqPayload.Window = &window
-			}
-
-			limiterCtx, cancel := context.WithTimeout(r.Context(), executionTimeout)
-			defer cancel()
-
-			if !strategy.IsAllowed(limiterCtx, reqPayload) {
-				http.Error(w, "Too Many Requests: Rate limit exceeded or quota exhausted.", http.StatusTooManyRequests)
-				return
-			}
-
-			next.ServeHTTP(w, r)
-		})
-	}
 }
