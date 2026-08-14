@@ -5,16 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 
 	"headsntails-core/config"
 	"headsntails-core/docs"
 	"headsntails-core/middleware"
+
+	sdk "github.com/NGUgeneral/headsntails-sdk/go/v1"
 
 	_ "headsntails-core/docs"
 
@@ -252,7 +259,6 @@ func main() {
 		limiterStrategy = middleware.NewGRPCRateLimiter(conn)
 		log.Printf("[MAIN] Rate Limiter initialized in high-performance gRPC mode targeting: %s", cfg.RateLimiterGRPCURL)
 	} else {
-		// Fall back to the default HTTP JSON endpoint path
 		limiterStrategy = middleware.NewHTTPRateLimiter(cfg.RateLimiterURL, RateLimitTimeout)
 		log.Printf("[MAIN] Rate Limiter initialized in standard HTTP mode targeting: %s", cfg.RateLimiterURL)
 	}
@@ -262,7 +268,7 @@ func main() {
 	// --- PUBLIC ROUTING ---
 	http.HandleFunc("/health", handleHealth(engine))
 
-	// --- AUTOMATED INTERACTIVE DOCUMENTATION TESTBENCH ---
+	// --- SWAGGER ROUTING ---
 	http.Handle("/docs/", httpSwagger.Handler(httpSwagger.URL("/docs/doc.json")))
 	http.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/docs/", http.StatusMovedPermanently)
@@ -270,12 +276,8 @@ func main() {
 
 	http.HandleFunc("/docs/doc.json", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-
-		// 1. Clear Host so Swagger UI auto-locks to the browser origin (localhost:80)
 		docs.SwaggerInfo.Host = ""
 		docs.SwaggerInfo.Schemes = []string{"http", "https"}
-
-		// 2. Set BasePath to match Nginx's incoming public ingress prefix routing route
 		docs.SwaggerInfo.BasePath = "/api/v1/flags"
 
 		var rawSpec interface{}
@@ -283,38 +285,74 @@ func main() {
 			http.Error(w, "Failed to build spec layout schema", http.StatusInternalServerError)
 			return
 		}
-
 		json.NewEncoder(w).Encode(rawSpec)
 	})
 
-	// --- PROTECTED ROUTING WITH INLINE DEFENSIVE RATE LIMITING ---
-	// Execution order: Auth verification -> Rate validation checks -> Flag computation logic
+	// --- PROTECTED HTTP ROUTING ---
 	http.Handle("/api/v1/get", authGuard(rateGuard(http.HandlerFunc(handleGetFlag(engine)))))
 	http.Handle("/api/v1/set", authGuard(rateGuard(http.HandlerFunc(handleSetFlag(engine)))))
 	http.Handle("/api/v1/get_flags", authGuard(rateGuard(http.HandlerFunc(handleGetFlagsByService(engine)))))
 
-	// --- GLOBAL INTERNET INGRESS WRAPPER ---
-	// Passing http.DefaultServeMux wrapped by CORSEnforcer ensures that /health, /docs,
-	// and all mutation endpoints catch the browser handshake automatically.
 	globalHandler := middleware.CORSEnforcer(http.DefaultServeMux)
 
-	log.Printf("headsntails Core online [%s mode]. Control port listening on :8080...", cfg.AppEnv)
-	if err := http.ListenAndServe(":8080", globalHandler); err != nil {
-		log.Fatalf("Server panic: %v", err)
+	httpServer := &http.Server{
+		Addr:    ":8080",
+		Handler: globalHandler,
 	}
+
+	// --- START HTTP SERVER IN BACKGROUND ---
+	go func() {
+		log.Printf("headsntails Core online [%s mode]. REST control port listening on :8080...", cfg.AppEnv)
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP Server panic: %v", err)
+		}
+	}()
+
+	// --- START SDK gRPC SERVER IN BACKGROUND (:50052) ---
+	grpcPort := ":50052"
+	grpcListener, err := net.Listen("tcp", grpcPort)
+	if err != nil {
+		log.Fatalf("CRITICAL: Failed to listen on gRPC SDK port %s: %v", grpcPort, err)
+	}
+
+	grpcServer := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			middleware.AuthUnaryInterceptor(secretBytes, cfg.JwtAlgorithm),
+			middleware.RateLimitUnaryInterceptor(limiterStrategy, RateLimitTimeout, cfg),
+		),
+	)
+	reflection.Register(grpcServer)
+	flagService := NewFlagServiceServer(engine)
+	sdk.RegisterFlagServiceServer(grpcServer, flagService)
+
+	go func() {
+		log.Printf("headsntails Core SDK gRPC listening on %s...", grpcPort)
+		if err := grpcServer.Serve(grpcListener); err != nil {
+			log.Fatalf("gRPC Server panic: %v", err)
+		}
+	}()
+
+	// --- GRACEFUL SHUTDOWN ORCHESTRATION ---
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	log.Println("Initiating graceful shutdown sequence...")
+
+	grpcServer.GracefulStop()
+	log.Println("gRPC SDK server stopped.")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP shutdown error: %v", err)
+	}
+	log.Println("HTTP server stopped. Clean exit.")
 }
 
-// --- EXTRACTED HANDLER LAYER CONTEXTS WITH SWAGGER TAGS ---
+// --- EXTRACTED HANDLERS ---
 
-// handleHealth godoc
-// @Summary      Engine Health Check
-// @Description  Verifies running web engine operations and synchronous underlying upstash storage ping telemetry.
-// @Tags         System
-// @Produce      json
-// @Success      200  {object}  HealthResponse
-// @Failure      503  {object}  HealthResponse  "Service Unavailable - Storage cluster connection broken"
-// @Failure      429      {object}  middleware.RateCheck429Response "Too Many Requests - Rate limit exceeded or quota exhausted"
-// @Router       /health [get]
 func handleHealth(engine *Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
