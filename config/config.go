@@ -41,8 +41,11 @@ type Config struct {
 func LoadConfig() *Config {
 	appEnv := getEnv("APP_ENV", "local")
 	if appEnv != "production" {
-		if err := godotenv.Load(); err != nil {
-			log.Println("⚠️ No .env file discovered; falling back to native environment variables.")
+		// Only attempt loading .env if it actually exists locally (e.g. running outside Docker via go run main.go)
+		if _, err := os.Stat(".env"); err == nil {
+			if err := godotenv.Load(); err != nil {
+				log.Println("⚠️ Failed to load discovered .env file:", err)
+			}
 		}
 	}
 
